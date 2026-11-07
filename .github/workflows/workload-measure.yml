@@ -1,0 +1,22 @@
+# Fork only: the CNTi workload tests on the chart's defaults. Not for upstream.
+name: Workload measure (fork)
+on:
+  push:
+    branches: [workload-measure]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  workload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: lfn-cnti/testsuite-action@3c0e163cbbdde302cdd9abb9dbe8c2cbd6a72c71 # v1.4.0
+        with:
+          version: v2.4.1
+          cnf_config: .github/cnti/cnti-testsuite.yaml
+          tests: workload
+          fail_on_failure: "false"
