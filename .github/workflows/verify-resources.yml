@@ -48,7 +48,8 @@ jobs:
       - name: Overfill past maxmemory (fix only)
         if: matrix.chart == 'fix'
         run: |
-          set -uo pipefail
+          # OOM error replies are the expected outcome here, not a failure.
+          set +e
           p=$(kubectl -n valkey get pod -o name | head -1)
           kubectl -n valkey exec $p -c valkey -- valkey-benchmark -q -t set -n 1500000 -r 3000000 -d 512 -P 16 2>&1 | tail -2
           echo "--- after overfill"
