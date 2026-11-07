@@ -1,0 +1,65 @@
+# Fork only: runs the Litmus pod-dns-error helper's command by hand to see dns_interceptor's own error. Not for upstream.
+name: dns_interceptor debug (fork)
+on:
+  push:
+    branches: [dns-interceptor-debug]
+permissions:
+  contents: read
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: helm/kind-action@v1.15.0
+      - name: Valkey and CoreDNS with their chart defaults
+        run: |
+          helm install valkey ./valkey -n valkey --create-namespace --wait --timeout 5m
+          helm repo add coredns https://coredns.github.io/helm
+          helm install coredns coredns/coredns -n coredns-cnti --create-namespace --wait --timeout 5m
+          kubectl get pods -A -o wide | grep -E 'valkey|coredns-cnti'
+      - name: A pod like the helper (go-runner 3.31.0, privileged, hostPID, containerd socket)
+        run: |
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: dnsdebug
+            namespace: default
+          spec:
+            hostPID: true
+            restartPolicy: Never
+            containers:
+              - name: helper
+                image: litmuschaos.docker.scarf.sh/litmuschaos/go-runner:3.31.0
+                command: ["/bin/bash", "-c", "sleep 3600"]
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: cri-socket
+                    mountPath: /run/containerd/containerd.sock
+            volumes:
+              - name: cri-socket
+                hostPath:
+                  path: /run/containerd/containerd.sock
+          YAML
+          kubectl wait --for=condition=Ready pod/dnsdebug --timeout=5m
+      - name: The helper's command against each target, with dns_interceptor's output
+        run: |
+          set +e
+          x() { kubectl exec dnsdebug -- /bin/bash -c "$1" 2>&1; }
+          x 'id; which nsutil dns_interceptor sudo; ls -l $(which nsutil) $(which dns_interceptor)'
+          for target in valkey-server coredns; do
+            echo "################ $target"
+            pid=$(x "for p in /proc/[0-9]*; do c=\$(tr '\0' ' ' < \$p/cmdline 2>/dev/null); case \"\$c\" in *$target*) echo \${p#/proc/}; break;; esac; done")
+            echo "target pid: $pid"
+            x "cat /proc/$pid/cmdline | tr '\0' ' '; echo"
+            echo "--- the target's /etc/resolv.conf, seen through nsutil"
+            x "sudo nsutil -p -n -m -t $pid -- cat /etc/resolv.conf; sudo nsutil -p -n -m -t $pid -- ls -l /etc/resolv.conf"
+            echo "--- UDP sockets in the target's network namespace"
+            x "sudo nsutil -n -t $pid -- cat /proc/net/udp | head -8"
+            echo "--- the helper's exact command, 8 s"
+            x "sudo TARGET_PID=$pid CHAOS_TYPE=error SPOOF_MAP='' TARGET_HOSTNAMES='' CHAOS_DURATION=8 MATCH_SCHEME=exact timeout 15 nsutil -p -n -t $pid -- dns_interceptor; echo exit=\$?"
+          done
