@@ -1,0 +1,86 @@
+# Fork-only verification of the resources/maxmemory defaults. Not for upstream.
+name: Verify resources defaults (fork)
+on:
+  push:
+    branches: [resources-defaults-verify]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: [main, fix]
+    name: measure (${{ matrix.chart }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The chart from upstream main
+        if: matrix.chart == 'main'
+        run: |
+          git remote add upstream https://github.com/valkey-io/valkey-helm
+          git fetch -q upstream main
+          git checkout upstream/main -- valkey
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: kind
+      - name: Install with the chart's defaults
+        run: |
+          helm install vk ./valkey -n valkey --create-namespace --wait --timeout 5m
+          kubectl -n valkey get pod -o jsonpath='{range .items[*]}{.metadata.name} qos={.status.qosClass}{"\n"}{range .spec.initContainers[*]}  init {.name}: {.resources}{"\n"}{end}{range .spec.containers[*]}  {.name}: {.resources}{"\n"}{end}{end}'
+      - name: Memory, idle and loaded
+        run: |
+          set -euo pipefail
+          p=$(kubectl -n valkey get pod -o name | head -1)
+          mem() {
+            echo "--- $1"
+            kubectl -n valkey exec $p -c valkey -- valkey-cli INFO memory | grep -E '^(used_memory_human|used_memory_peak_human|maxmemory_human|maxmemory_policy):' | tr -d '\r'
+            echo "cgroup memory.current: $(kubectl -n valkey exec $p -c valkey -- cat /sys/fs/cgroup/memory.current | awk '{printf "%.1f MiB", $1/1048576}')"
+          }
+          mem idle
+          kubectl -n valkey exec $p -c valkey -- valkey-benchmark -q -t set -n 200000 -r 200000 -d 512 -P 16 | tail -1
+          kubectl -n valkey exec $p -c valkey -- valkey-cli DBSIZE
+          mem "after 200000 keys of 512 bytes"
+      - name: Overfill past maxmemory (fix only)
+        if: matrix.chart == 'fix'
+        run: |
+          set -uo pipefail
+          p=$(kubectl -n valkey get pod -o name | head -1)
+          kubectl -n valkey exec $p -c valkey -- valkey-benchmark -q -t set -n 1500000 -r 3000000 -d 512 -P 16 2>&1 | tail -2
+          echo "--- after overfill"
+          kubectl -n valkey exec $p -c valkey -- valkey-cli INFO memory | grep -E '^(used_memory_human|maxmemory_human):' | tr -d '\r'
+          echo "cgroup memory.current: $(kubectl -n valkey exec $p -c valkey -- cat /sys/fs/cgroup/memory.current | awk '{printf "%.1f MiB", $1/1048576}')"
+          echo "cgroup memory.events: $(kubectl -n valkey exec $p -c valkey -- cat /sys/fs/cgroup/memory.events | tr '\n' ' ')"
+          echo "one more SET: $(kubectl -n valkey exec $p -c valkey -- valkey-cli SET one-more value 2>&1)"
+          echo "restarts: $(kubectl -n valkey get $p -o jsonpath='{.status.containerStatuses[0].restartCount}') lastState: $(kubectl -n valkey get $p -o jsonpath='{.status.containerStatuses[0].lastState}')"
+      - name: helm test
+        run: helm test vk -n valkey --timeout 5m
+
+  cnti:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: lfn-cnti/testsuite-action@3c0e163cbbdde302cdd9abb9dbe8c2cbd6a72c71 # v1.4.0
+        with:
+          version: v2.4.1
+          cnf_config: .github/cnti/cnti-testsuite.yaml
+          tests: cert
+          fail_on_failure: "false"
+
+  helm-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: README as helm-docs v1.14.2 writes it
+        run: |
+          docker run --rm -v "$PWD:/helm-docs" -u "$(id -u)" jnorwood/helm-docs:v1.14.2 --chart-search-root valkey
+          git diff --stat valkey/README.md
+          git diff --exit-code valkey/README.md && echo "README matches helm-docs"
