@@ -61,6 +61,90 @@ jobs:
       - name: helm test
         run: helm test vk -n valkey --timeout 5m
 
+  bgsave-cow:
+    # Worst case for the memory limit: a dataset just under maxmemory, a
+    # background save, and every key overwritten while it runs, so each page
+    # is copied once. rdb-key-save-delay stretches the save so the overwrites
+    # land inside it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: defaults 512Mi-192mb
+            set: ""
+          - name: documented 2Gi-900mb
+            set: "--set resources.limits.memory=2Gi --set maxmemory=900mb"
+    name: bgsave-cow (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: kind
+      - name: Install
+        run: |
+          helm install vk ./valkey -n valkey --create-namespace --wait --timeout 5m ${{ matrix.set }}
+          kubectl -n valkey get pod -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}: {.resources}{"\n"}{end}{end}'
+      - name: Fill, save, overwrite during the save
+        run: |
+          set +e
+          P=$(kubectl -n valkey get pod -o name | head -1)
+          cli() { kubectl -n valkey exec $P -c valkey -- valkey-cli "$@" | tr -d '\r'; }
+          field() { cli INFO "$1" | grep -E "^$2:" | cut -d: -f2; }
+          pipe() { kubectl -n valkey exec -i $P -c valkey -- valkey-cli --pipe; }
+          gen() { python3 -I -c '
+          import sys
+          start, count, tag = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+          out = sys.stdout.buffer
+          for i in range(start, start + count):
+              k = b"key:%d" % i
+              v = (tag.encode() * 512)[:512]
+              out.write(b"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$512\r\n%s\r\n" % (len(k), k, v))
+          ' "$@"; }
+          echo "save config: $(cli CONFIG GET save | tail -1)"
+          max=$(cli CONFIG GET maxmemory | tail -1)
+          echo "maxmemory: $max"
+          n=0
+          while :; do
+            left=$((max * 99 / 100 - $(field memory used_memory)))
+            [ $left -gt 0 ] && [ $n -lt 4000000 ] || break
+            c=$((left / 800)); [ $c -lt 1000 ] && c=1000
+            gen $n $c a | pipe | tail -1
+            n=$((n + c))
+          done
+          echo "filled: $n keys, used_memory $(field memory used_memory_human)"
+          kubectl -n valkey exec $P -c valkey -- sh -c 'echo "cgroup before save: current $(cat /sys/fs/cgroup/memory.current) peak $(cat /sys/fs/cgroup/memory.peak)"'
+          gen 0 $n b > /tmp/over-b; gen 0 $n c > /tmp/over-c
+          cli CONFIG SET rdb-key-save-delay 50
+          kubectl -n valkey exec $P -c valkey -- sh -c '
+            mx=0; ma=0; i=0
+            while [ $i -lt 1500 ]; do
+              c=$(cat /sys/fs/cgroup/memory.current)
+              a=$(grep "^anon " /sys/fs/cgroup/memory.stat | cut -d" " -f2)
+              [ "$c" -gt $mx ] && mx=$c; [ "$a" -gt $ma ] && ma=$a
+              i=$((i + 1)); sleep 0.1
+            done
+            echo "sampled max during save: current $((mx / 1048576)) MiB, anon $((ma / 1048576)) MiB"' > /tmp/samples 2>&1 &
+          sampler=$!
+          sleep 1
+          cli BGSAVE
+          pass=0
+          while [ "$(field persistence rdb_bgsave_in_progress)" = 1 ] && [ $pass -lt 20 ]; do
+            if [ $((pass % 2)) = 0 ]; then f=/tmp/over-b; else f=/tmp/over-c; fi
+            pipe < $f | tail -1
+            pass=$((pass + 1))
+          done
+          echo "overwrite passes during the save: $pass"
+          while [ "$(field persistence rdb_bgsave_in_progress)" = 1 ]; do sleep 1; done
+          wait $sampler; cat /tmp/samples
+          echo "--- after"
+          cli INFO persistence | grep -E '^(rdb_last_bgsave_status|rdb_last_cow_size|rdb_last_bgsave_time_sec):'
+          echo "used_memory: $(field memory used_memory_human)"
+          kubectl -n valkey exec $P -c valkey -- sh -c 'echo "cgroup peak $(($(cat /sys/fs/cgroup/memory.peak) / 1048576)) MiB, max $(cat /sys/fs/cgroup/memory.max), events: $(tr "\n" " " < /sys/fs/cgroup/memory.events)"'
+          echo "restarts: $(kubectl -n valkey get $P -o jsonpath='{.status.containerStatuses[0].restartCount}') lastState: $(kubectl -n valkey get $P -o jsonpath='{.status.containerStatuses[0].lastState}')"
+
   cnti:
     runs-on: ubuntu-latest
     steps:
