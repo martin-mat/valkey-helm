@@ -1,0 +1,93 @@
+# Fork only: verifies terminationMessagePolicy on the chart's containers. Not for upstream.
+name: Termination message verify (fork)
+on:
+  push:
+    branches: [tmp-verify]
+permissions:
+  contents: read
+jobs:
+  behaviour:
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: [main, fix]
+    name: bad config, then the termination message (${{ matrix.chart }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The chart from upstream main
+        if: matrix.chart == 'main'
+        run: |
+          git fetch -q https://github.com/valkey-io/valkey-helm main
+          git checkout FETCH_HEAD -- valkey
+      - uses: helm/kind-action@v1.15.0
+      - name: "Install with an unknown directive in extraConfig: valkey-server exits"
+        run: |
+          set +e
+          helm install vk ./valkey -n valkey --create-namespace --set-string extraConfig='nosuchdirective yes' --timeout 2m
+          sleep 60
+          p=$(kubectl -n valkey get pod -o name | head -1)
+          kubectl -n valkey get $p
+          echo "exit code: $(kubectl -n valkey get $p -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}')"
+          echo "termination message: [$(kubectl -n valkey get $p -o jsonpath='{.status.containerStatuses[0].lastState.terminated.message}')]"
+          kubectl -n valkey get $p -o jsonpath='{range .spec.initContainers[*]}{.name}={.terminationMessagePolicy}{" "}{end}{range .spec.containers[*]}{.name}={.terminationMessagePolicy}{" "}{end}{"\n"}'
+  cnti:
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: [main, fix]
+    name: cnti termination_message_policy (${{ matrix.chart }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The chart from upstream main
+        if: matrix.chart == 'main'
+        run: |
+          git fetch -q https://github.com/valkey-io/valkey-helm main
+          git checkout FETCH_HEAD -- valkey
+      - uses: lfn-cnti/testsuite-action@3c0e163cbbdde302cdd9abb9dbe8c2cbd6a72c71 # v1.4.0
+        with:
+          version: v2.4.1
+          cnf_config: .github/cnti/cnti-testsuite.yaml
+          tests: termination_message_policy
+          fail_on_failure: "false"
+
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.4
+      - name: values.schema.json as `just schema` writes it
+        run: |
+          helm plugin install https://github.com/losisin/helm-values-schema-json
+          helm plugin list
+          cd valkey && helm schema && cd ..
+          git diff --stat valkey/values.schema.json
+          git diff valkey/values.schema.json
+          git diff --quiet valkey/values.schema.json && echo "committed schema matches helm schema output"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: values-schema
+          path: valkey/values.schema.json
+          retention-days: 3
+  helm-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: README as helm-docs v1.14.2 writes it
+        run: |
+          docker run --rm -v "$PWD:/helm-docs" -u "$(id -u)" jnorwood/helm-docs:v1.14.2 --chart-search-root valkey
+          git diff --stat valkey/README.md
+          git diff --exit-code valkey/README.md && echo "README matches helm-docs"
