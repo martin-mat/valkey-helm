@@ -74,6 +74,28 @@ jobs:
           tests: cert
           fail_on_failure: "false"
 
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.4
+      - name: values.schema.json as `just schema` writes it
+        run: |
+          helm plugin install https://github.com/losisin/helm-values-schema-json
+          helm plugin list
+          cd valkey && helm schema && cd ..
+          git diff --stat valkey/values.schema.json
+          git diff valkey/values.schema.json
+          git diff --quiet valkey/values.schema.json && echo "committed schema matches helm schema output"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: values-schema
+          path: valkey/values.schema.json
+          retention-days: 3
   helm-docs:
     runs-on: ubuntu-latest
     steps:
