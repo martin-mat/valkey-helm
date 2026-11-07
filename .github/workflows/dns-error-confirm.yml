@@ -1,0 +1,49 @@
+# Fork only: pod_dns_error on Valkey, keeping the Litmus helper's log. Not for upstream.
+name: pod_dns_error confirm (fork)
+on:
+  push:
+    branches: [dns-error-confirm]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pod-dns-error:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Keep the logs of the chaos pods while they exist
+        run: |
+          mkdir -p /tmp/chaos-logs
+          nohup bash -c '
+            until kubectl get ns >/dev/null 2>&1; do sleep 5; done
+            while true; do
+              kubectl get pods -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null \
+                | grep -E "dns-error|helper|runner" | while read ns name; do
+                  kubectl logs -n "$ns" "$name" --all-containers --timestamps > "/tmp/chaos-logs/$ns.$name.log.tmp" 2>&1 \
+                    && mv "/tmp/chaos-logs/$ns.$name.log.tmp" "/tmp/chaos-logs/$ns.$name.log"
+                  kubectl get pod -n "$ns" "$name" -o yaml > "/tmp/chaos-logs/$ns.$name.yaml" 2>/dev/null
+                done
+              sleep 1
+            done' > /tmp/chaos-logs/collector.out 2>&1 &
+      - uses: lfn-cnti/testsuite-action@3c0e163cbbdde302cdd9abb9dbe8c2cbd6a72c71 # v1.4.0
+        with:
+          version: v2.4.1
+          cnf_config: .github/cnti/cnti-testsuite.yaml
+          tests: pod_dns_error
+          fail_on_failure: "false"
+      - name: What the chaos pods logged
+        if: always()
+        run: |
+          ls -la /tmp/chaos-logs
+          for f in /tmp/chaos-logs/*.log; do echo "===== $f"; cat "$f"; done
+          echo "===== helper pod spec (command, env, securityContext)"
+          for f in /tmp/chaos-logs/*helper*.yaml; do grep -E -A2 'command:|TARGET_CONTAINER|CONTAINER_RUNTIME|privileged|hostPID' "$f" | head -40; done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-logs
+          path: /tmp/chaos-logs
+          retention-days: 7
